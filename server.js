@@ -394,15 +394,38 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Debug: show parsed tracks from HypeM
+  // Debug: show raw HTML snippet AND parsed tracks
   if (path === '/debug/hypem') {
     try {
+      const user = process.env.HYPEM_USER || 'irieidea';
+      const r = await request(`https://hypem.com/${user}`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+      });
+      const body = r.body;
+      // Find first track-related chunk
+      const idx = body.indexOf('Siltbreeze');
+      const chunk = idx >= 0 ? body.slice(Math.max(0, idx-200), idx+600) : body.slice(0, 800);
+      // Count section splits
+      const sectionCount = (body.match(/\n### /g) || []).length;
       const tracks = await fetchHypemFavorites();
       res.writeHead(200);
-      res.end(JSON.stringify({ tracks_found: tracks.length, tracks }));
+      res.end(JSON.stringify({
+        http_status: r.status,
+        body_length: body.length,
+        section_count: sectionCount,
+        has_hash3: body.includes('### '),
+        has_backslash_dash: body.includes('\\-'),
+        has_siltbreeze: body.includes('Siltbreeze'),
+        raw_chunk: chunk,
+        tracks_found: tracks.length,
+        tracks,
+      }));
     } catch (e) {
       res.writeHead(500);
-      res.end(JSON.stringify({ error: e.message }));
+      res.end(JSON.stringify({ error: e.message, stack: e.stack }));
     }
     return;
   }
@@ -445,3 +468,5 @@ server.listen(PORT, () => {
   console.log(`Trigger: GET /run?secret=YOUR_SECRET`);
   console.log(`Debug:   GET /debug/hypem`);
 });
+ 
+ 
