@@ -1,0 +1,16 @@
+{
+  "name": "collateral-damage-pipeline",
+  "version": "1.0.0",
+  "description": "HypeM to Ghost autonomous publishing pipeline for mycollateraldamage.com",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "pipeline": "node pipeline.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
