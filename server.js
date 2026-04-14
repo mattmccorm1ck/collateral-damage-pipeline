@@ -141,15 +141,16 @@ async function fetchHypemFavorites() {
     const favMatch  = section.match(/class="[^"]*num-loved[^"]*"[^>]*>(\d+)</) ||
                      section.match(/<li[^>]*>\s*(\d+)\s*<\/li>/);
 
-    // Title: inside the <a href="/track/..."> title attribute
-    const titleAttrMatch = section.match(/href="\/track\/[a-z0-9]+\/[^"]*"\s+title="([^"]+)"/i);
-    // Fallback: second anchor text in h3
-    const titleTextMatch = section.match(/href="\/track\/[a-z0-9]+"[^>]*>([^<]+)<\/a>/i);
+    // Title: the second <a> inside the h3 links to /track/ and contains the title as text
+    // Format: <a href="/track/TRACKID/Artist+-+Title" title="Title">\n Title \n</a>
+    const titleLinkMatch = section.match(/href="\/track\/[a-z0-9]+\/[^"]*"[^>]*title="([^"]+)"/i);
+    // Fallback: text content of the track link
+    const titleTextMatch = section.match(/href="\/track\/[a-z0-9]+\/[^"]*"[^>]*>\s*([^<\n]+?)\s*<\/a>/i);
 
     const artist  = artistMatch[1].trim();
     const trackId = bcMatch ? bcMatch[1] : null;
-    const title   = titleAttrMatch
-      ? titleAttrMatch[1].trim()
+    const title   = titleLinkMatch
+      ? titleLinkMatch[1].trim()
       : (titleTextMatch ? titleTextMatch[1].trim() : null);
 
     if (!artist || !trackId || !title) continue;
