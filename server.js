@@ -1,30 +1,16 @@
 #!/usr/bin/env node
 
-/**
- * Collateral Damage — Pipeline Server
- *
- * Exposes two endpoints:
- *   GET  /health        — uptime check
- *   POST /run           — triggers the full HypeM → Ghost pipeline
- *   GET  /run           — same, for easy browser/chat triggering
- *
- * Secured by WEBHOOK_SECRET env var.
- * Call it: POST /run?secret=your_secret
- */
-
 require('dotenv').config();
 
-const http  = require('http');
-const https = require('https');
+const http   = require('http');
+const https  = require('https');
 const crypto = require('crypto');
-const url   = require('url');
+const url    = require('url');
 
 const PORT   = process.env.PORT || 3000;
 const SECRET = process.env.WEBHOOK_SECRET || 'change-me';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Utilities
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Utilities ─────────────────────────────────────────────────────────────────
 
 function log(msg, level = 'info') {
   const ts = new Date().toISOString().slice(11, 19);
@@ -38,10 +24,10 @@ function request(reqUrl, options = {}) {
     const lib = parsed.protocol === 'https:' ? https : http;
     const opts = {
       hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
+      port:     parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path:     parsed.pathname + parsed.search,
+      method:   options.method || 'GET',
+      headers:  options.headers || {},
     };
     const req = lib.request(opts, res => {
       let data = '';
@@ -69,9 +55,7 @@ function makeSlug(title, artist) {
     .replace(/^-|-$/g, '');
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Ghost API
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Ghost API ─────────────────────────────────────────────────────────────────
 
 function makeGhostJWT() {
   const key = process.env.GHOST_ADMIN_KEY;
@@ -109,84 +93,118 @@ async function ghostCreatePost(post) {
   return { status: res.status, data: JSON.parse(res.body) };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HypeM scraper
-// ─────────────────────────────────────────────────────────────────────────────
+// ── HypeM scraper ─────────────────────────────────────────────────────────────
+// Uses HypeM's public JSON playlist endpoint — no auth required
 
 async function fetchHypemFavorites() {
   const user = process.env.HYPEM_USER || 'irieidea';
-  log(`Fetching hypem.com/${user}...`);
-  const res = await request(`https://hypem.com/${user}`);
-  const html = res.body;
+  log(`Fetching HypeM favorites for ${user}...`);
+
   const tracks = [];
+  const UA = 'Mozilla/5.0 (compatible; CollateralDamageBlog/1.0)';
 
-  // Parse artist/title/trackId from anchor links
-  const pattern = /\[([^\]]+)\]\(https:\/\/hypem\.com\/artist\/[^)]+\)\s+-\s+\[([^\]]+)\]\(https:\/\/hypem\.com\/track\/([a-z0-9]+)\//g;
-  let match;
-  while ((match = pattern.exec(html)) !== null) {
-    const artist  = match[1].trim();
-    const title   = match[2].trim();
-    const trackId = match[3];
+  for (let page = 1; page <= 20; page++) {
+    const endpoint = `https://hypem.com/playlist/loved/${user}/json/${page}/data.js`;
+    log(`  Fetching page ${page}...`);
 
-    const nearby = html.slice(Math.max(0, match.index - 300), match.index + 600);
-
-    const favMatch  = nearby.match(/\*\s*(\d+)\s*\n\nPosted/);
-    const blogMatch = nearby.match(/\[([^\]]+)\]\(https:\/\/hypem\.com\/site\//);
-    const bcMatch   = nearby.match(/\[Bandcamp\]\(https:\/\/hypem\.com\/go\/bc\/([a-z0-9]+)\)/i);
-    const spMatch   = nearby.match(/\[Spotify\]\(https:\/\/hypem\.com\/go\/spotify_track\/([A-Za-z0-9]+)\)/);
-
-    tracks.push({
-      artist,
-      title,
-      trackId,
-      favorites:   favMatch  ? parseInt(favMatch[1])  : 0,
-      blog:        blogMatch ? blogMatch[1]            : '',
-      bandcampUrl: bcMatch   ? `https://hypem.com/go/bc/${bcMatch[1]}` : null,
-      spotifyUrl:  spMatch   ? `https://open.spotify.com/track/${spMatch[1]}` : null,
+    const res = await request(endpoint, {
+      headers: { 'User-Agent': UA, 'Accept': 'application/json, */*' }
     });
+
+    if (res.status !== 200) {
+      log(`  Page ${page} returned ${res.status} — stopping`, 'warn');
+      break;
+    }
+
+    // Parse JSON — strip JSONP wrapper if present
+    let body = res.body.trim();
+    if (body.startsWith('justify_me(')) body = body.slice('justify_me('.length, -1);
+    if (body.startsWith('(')) body = body.slice(1, -1);
+
+    let data;
+    try {
+      data = JSON.parse(body);
+    } catch (e) {
+      log(`  Page ${page}: JSON parse failed — ${e.message}`, 'warn');
+      log(`  Raw response (first 200): ${body.slice(0, 200)}`, 'warn');
+      break;
+    }
+
+    if (!Array.isArray(data) || data.length === 0) {
+      log(`  Page ${page}: empty or non-array response`, 'warn');
+      break;
+    }
+
+    for (const t of data) {
+      // Skip the "version" sentinel object HypeM sometimes adds
+      if (!t.artist || !t.title || t.type === 'version') continue;
+
+      const trackId = t.mediaid || t.itemid || '';
+      tracks.push({
+        artist:      t.artist,
+        title:       t.title,
+        trackId,
+        favorites:   t.loved_count   || 0,
+        blog:        t.sitename      || '',
+        // Bandcamp: HypeM stores it as go/bc/TRACKID redirect
+        bandcampUrl: trackId ? `https://hypem.com/go/bc/${trackId}` : null,
+        // Spotify: stored in t.links if present, or derive from known data
+        spotifyUrl:  (t.links && t.links.spotify) ? t.links.spotify : null,
+      });
+    }
+
+    log(`  Page ${page}: ${data.length} tracks (running total: ${tracks.length})`, 'ok');
+
+    // HypeM returns max 20 per page; fewer means we're on the last page
+    if (data.length < 20) break;
+
+    await sleep(300);
   }
 
-  log(`Found ${tracks.length} tracks`, 'ok');
+  log(`Found ${tracks.length} total favorites`, tracks.length > 0 ? 'ok' : 'warn');
   return tracks;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Album art resolver — Spotify oEmbed → Bandcamp CDN → MusicBrainz CAA
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Album art resolver ────────────────────────────────────────────────────────
 
 async function resolveArt(track) {
-  // 1. Spotify oEmbed
+  // 1. Spotify oEmbed — clean, reliable, returns 300x300 art
   if (track.spotifyUrl) {
     try {
-      const res = await request(`https://open.spotify.com/oembed?url=${encodeURIComponent(track.spotifyUrl)}`);
+      const res = await request(
+        `https://open.spotify.com/oembed?url=${encodeURIComponent(track.spotifyUrl)}`
+      );
       if (res.status === 200) {
         const data = JSON.parse(res.body);
         if (data.thumbnail_url) {
-          log(`  Art: Spotify → ${data.title || track.title}`, 'ok');
+          log(`  Art: Spotify oEmbed`, 'ok');
           return data.thumbnail_url;
         }
       }
     } catch (_) {}
   }
 
-  // 2. Bandcamp CDN — follow redirect to get album page, extract art ID
+  // 2. Bandcamp CDN — follow hypem redirect → bandcamp page → extract art ID
   if (track.bandcampUrl) {
     try {
-      const redir = await request(track.bandcampUrl);
-      const bcUrl = redir.headers.location || '';
+      const redir = await request(track.bandcampUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
+      const bcUrl = redir.headers.location || redir.headers.Location || '';
       if (bcUrl.includes('bandcamp.com')) {
-        const page = await request(bcUrl.split('?')[0]);
+        const page = await request(bcUrl.split('?')[0], {
+          headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
         const artMatch = page.body.match(/f4\.bcbits\.com\/img\/a(\d+)_/);
         if (artMatch) {
-          const artUrl = `https://f4.bcbits.com/img/a${artMatch[1]}_10.jpg`;
-          log(`  Art: Bandcamp CDN → ${artMatch[1]}`, 'ok');
-          return artUrl;
+          log(`  Art: Bandcamp CDN (id: ${artMatch[1]})`, 'ok');
+          return `https://f4.bcbits.com/img/a${artMatch[1]}_10.jpg`;
         }
       }
     } catch (_) {}
   }
 
-  // 3. MusicBrainz / Cover Art Archive
+  // 3. MusicBrainz Cover Art Archive
   try {
     const q = encodeURIComponent(`artist:"${track.artist}" AND release:"${track.title}"`);
     const res = await request(
@@ -203,21 +221,18 @@ async function resolveArt(track) {
       if (caa.status === 200) {
         const imgs = JSON.parse(caa.body).images || [];
         if (imgs[0]) {
-          const artUrl = imgs[0].thumbnails?.large || imgs[0].image;
-          log(`  Art: MusicBrainz → ${rel.id}`, 'ok');
-          return artUrl;
+          log(`  Art: MusicBrainz CAA`, 'ok');
+          return imgs[0].thumbnails?.large || imgs[0].image;
         }
       }
     }
   } catch (_) {}
 
-  log(`  Art: none found for "${track.artist}"`, 'warn');
+  log(`  Art: none found`, 'warn');
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Claude post writer
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Claude post writer ────────────────────────────────────────────────────────
 
 async function writePost(track) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -233,18 +248,18 @@ async function writePost(track) {
 
   const prompt = `Write a music blog post for mycollateraldamage.com.
 
-Voice: passionate, witty underground music head. Opinionated. Specific. No clichés. No markdown. Plain HTML paragraphs only. 2-3 paragraphs. No preamble, no explanation.
+Voice: passionate, witty underground music head. Opinionated. Specific. No clichés. No markdown. Plain HTML paragraphs only. 2-3 paragraphs. No preamble, no explanation, no meta-commentary.
 
 Track: "${track.title}" by ${track.artist}
 ${track.blog ? `Originally posted by: ${track.blog}` : ''}
 
 First use web_search to research this artist and track. Then write the post.
 
-After your prose, output EXACTLY this HTML verbatim:
+After your prose paragraphs, output EXACTLY this HTML verbatim with no changes:
 ${bc || sp ? `<p>${bc}${sp}</p>` : ''}
 ${footer}
 
-Return ONLY the HTML. Nothing else.`;
+Return ONLY the HTML body. Nothing else before or after.`;
 
   const body = JSON.stringify({
     model: 'claude-sonnet-4-20250514',
@@ -272,18 +287,15 @@ Return ONLY the HTML. Nothing else.`;
     .join('\n')
     .trim();
 
-  if (!html || html.length < 100) throw new Error('Post body too short — Claude may have failed');
+  if (!html || html.length < 100) throw new Error('Post body too short');
   return html;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Dedup
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Dedup ─────────────────────────────────────────────────────────────────────
 
 function isDuplicate(track, publishedSlugs, publishedTitles) {
   const slug = makeSlug(track.title, track.artist);
   if (publishedSlugs.has(slug)) return true;
-  // Ghost auto-appends -2, -3 etc on slug collision
   if (publishedSlugs.has(`${slug}-2`) || publishedSlugs.has(`${slug}-3`)) return true;
   const na = normalize(track.artist);
   const nt = normalize(track.title);
@@ -293,9 +305,7 @@ function isDuplicate(track, publishedSlugs, publishedTitles) {
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main pipeline
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Main pipeline ─────────────────────────────────────────────────────────────
 
 async function runPipeline(logLines) {
   const emit = (msg, level = 'info') => {
@@ -305,7 +315,7 @@ async function runPipeline(logLines) {
 
   emit('Pipeline started');
 
-  // 1. Get existing posts from Ghost
+  // 1. Get existing Ghost posts for dedup
   emit('Fetching existing Ghost posts...');
   const postData = await ghostGet('/posts/?status=all&fields=slug,title&limit=all');
   const allPosts = postData.posts || [];
@@ -315,9 +325,9 @@ async function runPipeline(logLines) {
 
   // 2. Fetch HypeM favorites
   const tracks = await fetchHypemFavorites();
-  logLines.push({ ts: new Date().toISOString(), level: 'ok', msg: `${tracks.length} HypeM favorites fetched` });
+  emit(`${tracks.length} HypeM favorites fetched`, tracks.length > 0 ? 'ok' : 'warn');
 
-  // 3. Filter new
+  // 3. Filter to new tracks only
   const newTracks = tracks.filter(t => !isDuplicate(t, publishedSlugs, publishedTitles));
   emit(`${newTracks.length} new tracks to publish`);
 
@@ -332,17 +342,13 @@ async function runPipeline(logLines) {
   for (const track of newTracks) {
     emit(`Processing: ${track.artist} — ${track.title}`);
     try {
-      // Art
-      const art = await resolveArt(track);
-
-      // Write
-      emit(`  Writing post...`);
+      const art  = await resolveArt(track);
+      emit(`  Writing post with Claude...`);
       const html = await writePost(track);
       emit(`  Post written (${html.length} chars)`, 'ok');
 
-      // Publish
-      const slug  = makeSlug(track.title, track.artist);
-      const title = `${track.title} by ${track.artist}`;
+      const slug    = makeSlug(track.title, track.artist);
+      const title   = `${track.title} by ${track.artist}`;
       const lexical = JSON.stringify({
         root: {
           children: [{ type: 'html', version: 1, html }],
@@ -350,16 +356,15 @@ async function runPipeline(logLines) {
         },
       });
 
-      const postPayload = {
+      const result = await ghostCreatePost({
         title,
         slug,
         status: process.env.POST_STATUS || 'draft',
         lexical,
         custom_excerpt: `${track.artist} — ${track.title}${track.blog ? ` via ${track.blog}` : ''}`,
         ...(art ? { feature_image: art } : {}),
-      };
+      });
 
-      const result = await ghostCreatePost(postPayload);
       if (result.status !== 201) {
         throw new Error(`Ghost ${result.status}: ${JSON.stringify(result.data.errors?.[0]?.message || result.data)}`);
       }
@@ -367,12 +372,10 @@ async function runPipeline(logLines) {
       const created = result.data.posts?.[0];
       emit(`  Published: ${created.slug}`, 'ok');
       published.push({ title, slug: created.slug, art: !!art });
-
-      // Register in dedup so we don't re-publish within the same run
       publishedSlugs.add(slug);
       publishedTitles.push(title);
 
-      await sleep(1500); // be polite to APIs between posts
+      await sleep(1500);
 
     } catch (err) {
       emit(`  FAILED: ${err.message}`, 'err');
@@ -384,9 +387,7 @@ async function runPipeline(logLines) {
   return { published, failed };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HTTP server
-// ─────────────────────────────────────────────────────────────────────────────
+// ── HTTP server ───────────────────────────────────────────────────────────────
 
 let running = false;
 
@@ -395,36 +396,54 @@ const server = http.createServer(async (req, res) => {
   const path   = parsed.pathname;
   const secret = parsed.query.secret;
 
-  // CORS headers so browser requests work too
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
 
-  // Health check — no auth required
+  // Health check
   if (path === '/health') {
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, running, ts: new Date().toISOString() }));
     return;
   }
 
-  // Pipeline trigger — requires secret
+  // Debug: show raw HypeM JSON response (no auth needed, safe to expose)
+  if (path === '/debug/hypem') {
+    try {
+      const user = process.env.HYPEM_USER || 'irieidea';
+      const endpoint = `https://hypem.com/playlist/loved/${user}/json/1/data.js`;
+      const r = await request(endpoint, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json, */*' }
+      });
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        status: r.status,
+        url: endpoint,
+        body_length: r.body.length,
+        body_preview: r.body.slice(0, 500),
+      }));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // Run pipeline
   if (path === '/run') {
     if (secret !== SECRET) {
       res.writeHead(401);
       res.end(JSON.stringify({ error: 'Invalid secret' }));
       return;
     }
-
     if (running) {
       res.writeHead(409);
       res.end(JSON.stringify({ error: 'Pipeline already running' }));
       return;
     }
 
-    // Respond immediately so the HTTP request doesn't time out
     res.writeHead(202);
-    res.end(JSON.stringify({ ok: true, message: 'Pipeline started — check logs' }));
+    res.end(JSON.stringify({ ok: true, message: 'Pipeline started — check Railway logs' }));
 
-    // Run async
     running = true;
     const logLines = [];
     try {
@@ -444,5 +463,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Collateral Damage pipeline server listening on port ${PORT}`);
-  console.log(`Trigger: POST/GET /run?secret=${SECRET}`);
+  console.log(`Trigger: GET /run?secret=YOUR_SECRET`);
+  console.log(`Debug:   GET /debug/hypem`);
 });
