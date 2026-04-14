@@ -104,7 +104,6 @@ async function fetchHypemFavorites() {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
     }
   });
 
@@ -114,32 +113,54 @@ async function fetchHypemFavorites() {
   }
 
   const tracks = [];
-  // Split page into per-track sections on ### headings
-  const sections = res.body.split(/(?=###\s)/);
+  const body = res.body;
+
+  // Raw HTML format — split into sections on <h3 class
+  // Each track block contains:
+  //   href="/track/TRACKID/Artist+-+Title"
+  //   href="/artist/ArtistName"  (inside h3)
+  //   href="/go/bc/TRACKID"
+  //   href="/go/spotify_track/SPOTIFYID"  (optional)
+  //   href="/site/blogname/ID"
+  //   class="num-loved">N<
+
+  // Split on track anchor tags that precede each h3 block
+  const sections = body.split(/<h3[^>]*>/);
 
   for (const section of sections) {
-    const artistMatch = section.match(/###\s+\[([^\]]+)\]/);
-    const titleMatch  = section.match(/\[\s*([^\]\n]+?)\s*\]\(\/track\/([a-z0-9]+)\//);
-    if (!artistMatch || !titleMatch) continue;
+    // Artist is in first anchor inside h3: <a href="/artist/...">ArtistName</a>
+    const artistMatch = section.match(/href="\/artist\/[^"]*"[^>]*>([^<]+)<\/a>/);
+    if (!artistMatch) continue;
 
-    const artist  = decodeURIComponent(artistMatch[1].replace(/\+/g, ' ')).trim();
-    const title   = titleMatch[1].trim();
-    const trackId = titleMatch[2];
-    if (!artist || !title || !trackId) continue;
+    // Track title and ID: href="/track/TRACKID/..."  title="Title"
+    // Also appears just before the h3 as a cover link — look in nearby context
+    // Find the track ID from /go/bc/ link which uses same TRACKID
+    const bcMatch  = section.match(/href="\/go\/bc\/([a-z0-9]+)"/i);
+    const spMatch  = section.match(/href="\/go\/spotify_track\/([A-Za-z0-9]+)"/i);
+    const blogMatch = section.match(/href="\/site\/[^"]*"[^>]*>([^<]+)<\/a>/);
+    const favMatch  = section.match(/class="[^"]*num-loved[^"]*"[^>]*>(\d+)</) ||
+                     section.match(/<li[^>]*>\s*(\d+)\s*<\/li>/);
 
-    const favMatch  = section.match(/\*\s*(\d+)/);
-    const blogMatch = section.match(/\[([^\]]+)\]\(\/site\//);
-    const bcMatch   = section.match(/\/go\/bc\/([a-z0-9]+)/i);
-    const spMatch   = section.match(/\/go\/spotify%5Ftrack\/([A-Za-z0-9]+)/i) ||
-                     section.match(/\/go\/spotify_track\/([A-Za-z0-9]+)/i);
+    // Title: inside the <a href="/track/..."> title attribute
+    const titleAttrMatch = section.match(/href="\/track\/[a-z0-9]+\/[^"]*"\s+title="([^"]+)"/i);
+    // Fallback: second anchor text in h3
+    const titleTextMatch = section.match(/href="\/track\/[a-z0-9]+"[^>]*>([^<]+)<\/a>/i);
+
+    const artist  = artistMatch[1].trim();
+    const trackId = bcMatch ? bcMatch[1] : null;
+    const title   = titleAttrMatch
+      ? titleAttrMatch[1].trim()
+      : (titleTextMatch ? titleTextMatch[1].trim() : null);
+
+    if (!artist || !trackId || !title) continue;
 
     tracks.push({
       artist,
       title,
       trackId,
-      favorites:   favMatch  ? parseInt(favMatch[1])  : 0,
-      blog:        blogMatch ? blogMatch[1].trim()     : '',
-      bandcampUrl: bcMatch   ? `https://hypem.com/go/bc/${bcMatch[1]}` : null,
+      favorites:   favMatch  ? parseInt(favMatch[1])          : 0,
+      blog:        blogMatch ? blogMatch[1].trim()             : '',
+      bandcampUrl: `https://hypem.com/go/bc/${trackId}`,
       spotifyUrl:  spMatch   ? `https://open.spotify.com/track/${spMatch[1]}` : null,
     });
   }
@@ -389,31 +410,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Debug: show raw HypeM page snippet so we can see the format
+  // Debug: show parsed tracks from HypeM
   if (path === '/debug/hypem') {
     try {
-      const user = process.env.HYPEM_USER || 'irieidea';
-      const endpoint = `https://hypem.com/${user}`;
-      const r = await request(endpoint, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
-      });
-      // Find the section of the page with track data
-      const body = r.body;
-      const idx = body.indexOf('Siltbreeze') !== -1 ? body.indexOf('Siltbreeze') :
-                  body.indexOf('track') !== -1 ? body.indexOf('track') : 0;
+      const tracks = await fetchHypemFavorites();
       res.writeHead(200);
-      res.end(JSON.stringify({
-        status: r.status,
-        body_length: body.length,
-        has_siltbreeze: body.includes('Siltbreeze'),
-        has_h3: body.includes('<h3'),
-        has_hash3: body.includes('### '),
-        has_trackid: body.includes('/track/383sr'),
-        snippet_around_track: body.slice(Math.max(0, idx - 100), idx + 500),
-      }));
+      res.end(JSON.stringify({ tracks_found: tracks.length, tracks }));
     } catch (e) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: e.message }));
