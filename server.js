@@ -389,20 +389,36 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Debug: show raw HypeM JSON response (no auth needed, safe to expose)
+  // Debug: show parsed HypeM tracks (no auth needed)
   if (path === '/debug/hypem') {
     try {
       const user = process.env.HYPEM_USER || 'irieidea';
-      const endpoint = `https://hypem.com/playlist/loved/${user}/json/1/data.js`;
+      const endpoint = `https://hypem.com/${user}`;
       const r = await request(endpoint, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json, */*' }
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
       });
+      // Parse tracks using the same logic as fetchHypemFavorites
+      const tracks = [];
+      const sections = r.body.split(/(?=###\s)/);
+      for (const section of sections) {
+        const artistMatch = section.match(/###\s+\[([^\]]+)\]/);
+        const titleMatch  = section.match(/\[\s*([^\]\n]+?)\s*\]\(\/track\/([a-z0-9]+)\//);
+        if (!artistMatch || !titleMatch) continue;
+        tracks.push({
+          artist:   decodeURIComponent(artistMatch[1].replace(/\+/g, ' ')).trim(),
+          title:    titleMatch[1].trim(),
+          trackId:  titleMatch[2],
+        });
+      }
       res.writeHead(200);
       res.end(JSON.stringify({
         status: r.status,
         url: endpoint,
-        body_length: r.body.length,
-        body_preview: r.body.slice(0, 500),
+        tracks_found: tracks.length,
+        tracks,
       }));
     } catch (e) {
       res.writeHead(500);
