@@ -113,30 +113,25 @@ async function fetchHypemFavorites() {
   }
 
   const tracks = [];
-  // HypeM renders as markdown-like format with ### headings per track
-  // Split on ### to get one section per track
-  const sections = res.body.split(/(?=\n### )/);
+  const body = res.body;
+
+  // Raw HTML — split on <h3 tags, one section per track
+  const sections = body.split(/<h3[^>]*>/);
 
   for (const section of sections) {
-    // Artist: ### [Artist Name](...)
-    const artistMatch = section.match(/^### \[([^\]]+)\]/m);
-    if (!artistMatch) continue;
+    const artistMatch  = section.match(/class="artist"[^>]*>([^<]+)<\/a>/);
+    const titleMatch   = section.match(/class="track"\s+title="([^"]+?)\s*-\s*go to page[^"]*"/i);
+    const trackIdMatch = section.match(/href="\/track\/([a-z0-9]+)\//i);
+    if (!artistMatch || !titleMatch || !trackIdMatch) continue;
 
-    // Title text sits between [ and ] after the \-
-    // Format: \- [ Title ](/track/TRACKID/...)
-    const titleMatch = section.match(/\\-\s+\[\s*([^\]]+?)\s*\]\(\/track\/([a-z0-9]+)\//);
-    if (!titleMatch) continue;
-
-    const artist  = decodeURIComponent(artistMatch[1].replace(/\+/g, ' ')).trim();
+    const artist  = artistMatch[1].trim();
     const title   = titleMatch[1].trim();
-    const trackId = titleMatch[2];
-    if (!artist || !title || !trackId) continue;
+    const trackId = trackIdMatch[1];
 
-    const favMatch  = section.match(/^\* (\d+)/m);
-    const blogMatch = section.match(/\[([^\]]+)\]\(\/site\//);
-    const bcMatch   = section.match(/\[Bandcamp\]\(\/go\/bc\/([a-z0-9]+)\)/i);
-    const spMatch   = section.match(/\[Spotify\]\(\/go\/spotify%5Ftrack\/([A-Za-z0-9]+)\)/i) ||
-                      section.match(/\[Spotify\]\(\/go\/spotify_track\/([A-Za-z0-9]+)\)/i);
+    const favMatch  = section.match(/class="num-loved"[^>]*>(\d+)</);
+    const blogMatch = section.match(/href="\/site\/[^"]*"[^>]*>([^<]+)<\/a>/);
+    const bcMatch   = section.match(/href="\/go\/bc\/([a-z0-9]+)"/i);
+    const spMatch   = section.match(/href="\/go\/spotify_track\/([A-Za-z0-9]+)"/i);
 
     tracks.push({
       artist,
@@ -152,6 +147,7 @@ async function fetchHypemFavorites() {
   log(`Found ${tracks.length} favorites`, tracks.length > 0 ? 'ok' : 'warn');
   return tracks;
 }
+
 
 // ── Album art resolver ────────────────────────────────────────────────────────
 
@@ -468,5 +464,3 @@ server.listen(PORT, () => {
   console.log(`Trigger: GET /run?secret=YOUR_SECRET`);
   console.log(`Debug:   GET /debug/hypem`);
 });
- 
- 
