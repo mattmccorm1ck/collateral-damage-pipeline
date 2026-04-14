@@ -113,55 +113,38 @@ async function fetchHypemFavorites() {
   }
 
   const tracks = [];
-  const body = res.body;
-
-  // Raw HTML format — split into sections on <h3 class
-  // Each track block contains:
-  //   href="/track/TRACKID/Artist+-+Title"
-  //   href="/artist/ArtistName"  (inside h3)
-  //   href="/go/bc/TRACKID"
-  //   href="/go/spotify_track/SPOTIFYID"  (optional)
-  //   href="/site/blogname/ID"
-  //   class="num-loved">N<
-
-  // Split on track anchor tags that precede each h3 block
-  const sections = body.split(/<h3[^>]*>/);
+  // HypeM renders as markdown-like format with ### headings per track
+  // Split on ### to get one section per track
+  const sections = res.body.split(/(?=\n### )/);
 
   for (const section of sections) {
-    // Artist is in first anchor inside h3: <a href="/artist/...">ArtistName</a>
-    const artistMatch = section.match(/href="\/artist\/[^"]*"[^>]*>([^<]+)<\/a>/);
+    // Artist: ### [Artist Name](...)
+    const artistMatch = section.match(/^### \[([^\]]+)\]/m);
     if (!artistMatch) continue;
 
-    // Track title and ID: href="/track/TRACKID/..."  title="Title"
-    // Also appears just before the h3 as a cover link — look in nearby context
-    // Find the track ID from /go/bc/ link which uses same TRACKID
-    const bcMatch  = section.match(/href="\/go\/bc\/([a-z0-9]+)"/i);
-    const spMatch  = section.match(/href="\/go\/spotify_track\/([A-Za-z0-9]+)"/i);
-    const blogMatch = section.match(/href="\/site\/[^"]*"[^>]*>([^<]+)<\/a>/);
-    const favMatch  = section.match(/class="[^"]*num-loved[^"]*"[^>]*>(\d+)</) ||
-                     section.match(/<li[^>]*>\s*(\d+)\s*<\/li>/);
+    // Title text sits between [ and ] after the \-
+    // Format: \- [ Title ](/track/TRACKID/...)
+    const titleMatch = section.match(/\\-\s+\[\s*([^\]]+?)\s*\]\(\/track\/([a-z0-9]+)\//);
+    if (!titleMatch) continue;
 
-    // Title: inside h3, the track link has title="Track Title - go to page for this track"
-    // Strip the suffix to get just the title
-    const titleAttrMatch = section.match(/href="\/track\/[a-z0-9]+\/[^"]*"[^>]*title="([^"]+?)\s*-\s*go to page[^"]*"/i);
-    // Fallback: text content of track anchor
-    const titleTextMatch = section.match(/href="\/track\/[a-z0-9]+\/[^"]*"[^>]*>\s*([^<\n]+?)\s*<\/a>/i);
+    const artist  = decodeURIComponent(artistMatch[1].replace(/\+/g, ' ')).trim();
+    const title   = titleMatch[1].trim();
+    const trackId = titleMatch[2];
+    if (!artist || !title || !trackId) continue;
 
-    const artist  = artistMatch[1].trim();
-    const trackId = bcMatch ? bcMatch[1] : null;
-    const title   = titleAttrMatch
-      ? titleAttrMatch[1].trim()
-      : (titleTextMatch ? titleTextMatch[1].trim() : null);
-
-    if (!artist || !trackId || !title) continue;
+    const favMatch  = section.match(/^\* (\d+)/m);
+    const blogMatch = section.match(/\[([^\]]+)\]\(\/site\//);
+    const bcMatch   = section.match(/\[Bandcamp\]\(\/go\/bc\/([a-z0-9]+)\)/i);
+    const spMatch   = section.match(/\[Spotify\]\(\/go\/spotify%5Ftrack\/([A-Za-z0-9]+)\)/i) ||
+                      section.match(/\[Spotify\]\(\/go\/spotify_track\/([A-Za-z0-9]+)\)/i);
 
     tracks.push({
       artist,
       title,
       trackId,
-      favorites:   favMatch  ? parseInt(favMatch[1])          : 0,
-      blog:        blogMatch ? blogMatch[1].trim()             : '',
-      bandcampUrl: `https://hypem.com/go/bc/${trackId}`,
+      favorites:   favMatch  ? parseInt(favMatch[1])  : 0,
+      blog:        blogMatch ? blogMatch[1].trim()     : '',
+      bandcampUrl: bcMatch   ? `https://hypem.com/go/bc/${bcMatch[1]}` : null,
       spotifyUrl:  spMatch   ? `https://open.spotify.com/track/${spMatch[1]}` : null,
     });
   }
