@@ -389,7 +389,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Debug: show parsed HypeM tracks (no auth needed)
+  // Debug: show raw HypeM page snippet so we can see the format
   if (path === '/debug/hypem') {
     try {
       const user = process.env.HYPEM_USER || 'irieidea';
@@ -400,25 +400,19 @@ const server = http.createServer(async (req, res) => {
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         }
       });
-      // Parse tracks using the same logic as fetchHypemFavorites
-      const tracks = [];
-      const sections = r.body.split(/(?=###\s)/);
-      for (const section of sections) {
-        const artistMatch = section.match(/###\s+\[([^\]]+)\]/);
-        const titleMatch  = section.match(/\[\s*([^\]\n]+?)\s*\]\(\/track\/([a-z0-9]+)\//);
-        if (!artistMatch || !titleMatch) continue;
-        tracks.push({
-          artist:   decodeURIComponent(artistMatch[1].replace(/\+/g, ' ')).trim(),
-          title:    titleMatch[1].trim(),
-          trackId:  titleMatch[2],
-        });
-      }
+      // Find the section of the page with track data
+      const body = r.body;
+      const idx = body.indexOf('Siltbreeze') !== -1 ? body.indexOf('Siltbreeze') :
+                  body.indexOf('track') !== -1 ? body.indexOf('track') : 0;
       res.writeHead(200);
       res.end(JSON.stringify({
         status: r.status,
-        url: endpoint,
-        tracks_found: tracks.length,
-        tracks,
+        body_length: body.length,
+        has_siltbreeze: body.includes('Siltbreeze'),
+        has_h3: body.includes('<h3'),
+        has_hash3: body.includes('### '),
+        has_trackid: body.includes('/track/383sr'),
+        snippet_around_track: body.slice(Math.max(0, idx - 100), idx + 500),
       }));
     } catch (e) {
       res.writeHead(500);
