@@ -100,68 +100,51 @@ async function fetchHypemFavorites() {
   const user = process.env.HYPEM_USER || 'irieidea';
   log(`Fetching HypeM favorites for ${user}...`);
 
-  const tracks = [];
-  const UA = 'Mozilla/5.0 (compatible; CollateralDamageBlog/1.0)';
-
-  for (let page = 1; page <= 20; page++) {
-    const endpoint = `https://hypem.com/playlist/loved/${user}/json/${page}/data.js`;
-    log(`  Fetching page ${page}...`);
-
-    const res = await request(endpoint, {
-      headers: { 'User-Agent': UA, 'Accept': 'application/json, */*' }
-    });
-
-    if (res.status !== 200) {
-      log(`  Page ${page} returned ${res.status} — stopping`, 'warn');
-      break;
+  const res = await request(`https://hypem.com/${user}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
     }
+  });
 
-    // Parse JSON — strip JSONP wrapper if present
-    let body = res.body.trim();
-    if (body.startsWith('justify_me(')) body = body.slice('justify_me('.length, -1);
-    if (body.startsWith('(')) body = body.slice(1, -1);
-
-    let data;
-    try {
-      data = JSON.parse(body);
-    } catch (e) {
-      log(`  Page ${page}: JSON parse failed — ${e.message}`, 'warn');
-      log(`  Raw response (first 200): ${body.slice(0, 200)}`, 'warn');
-      break;
-    }
-
-    if (!Array.isArray(data) || data.length === 0) {
-      log(`  Page ${page}: empty or non-array response`, 'warn');
-      break;
-    }
-
-    for (const t of data) {
-      // Skip the "version" sentinel object HypeM sometimes adds
-      if (!t.artist || !t.title || t.type === 'version') continue;
-
-      const trackId = t.mediaid || t.itemid || '';
-      tracks.push({
-        artist:      t.artist,
-        title:       t.title,
-        trackId,
-        favorites:   t.loved_count   || 0,
-        blog:        t.sitename      || '',
-        // Bandcamp: HypeM stores it as go/bc/TRACKID redirect
-        bandcampUrl: trackId ? `https://hypem.com/go/bc/${trackId}` : null,
-        // Spotify: stored in t.links if present, or derive from known data
-        spotifyUrl:  (t.links && t.links.spotify) ? t.links.spotify : null,
-      });
-    }
-
-    log(`  Page ${page}: ${data.length} tracks (running total: ${tracks.length})`, 'ok');
-
-    // HypeM returns max 20 per page; fewer means we're on the last page
-    if (data.length < 20) break;
-
-    await sleep(300);
+  if (res.status !== 200) {
+    log(`HypeM returned ${res.status}`, 'err');
+    return [];
   }
 
-  log(`Found ${tracks.length} total favorites`, tracks.length > 0 ? 'ok' : 'warn');
+  const tracks = [];
+  // Split page into per-track sections on ### headings
+  const sections = res.body.split(/(?=###\s)/);
+
+  for (const section of sections) {
+    const artistMatch = section.match(/###\s+\[([^\]]+)\]/);
+    const titleMatch  = section.match(/\[\s*([^\]\n]+?)\s*\]\(\/track\/([a-z0-9]+)\//);
+    if (!artistMatch || !titleMatch) continue;
+
+    const artist  = decodeURIComponent(artistMatch[1].replace(/\+/g, ' ')).trim();
+    const title   = titleMatch[1].trim();
+    const trackId = titleMatch[2];
+    if (!artist || !title || !trackId) continue;
+
+    const favMatch  = section.match(/\*\s*(\d+)/);
+    const blogMatch = section.match(/\[([^\]]+)\]\(\/site\//);
+    const bcMatch   = section.match(/\/go\/bc\/([a-z0-9]+)/i);
+    const spMatch   = section.match(/\/go\/spotify%5Ftrack\/([A-Za-z0-9]+)/i) ||
+                     section.match(/\/go\/spotify_track\/([A-Za-z0-9]+)/i);
+
+    tracks.push({
+      artist,
+      title,
+      trackId,
+      favorites:   favMatch  ? parseInt(favMatch[1])  : 0,
+      blog:        blogMatch ? blogMatch[1].trim()     : '',
+      bandcampUrl: bcMatch   ? `https://hypem.com/go/bc/${bcMatch[1]}` : null,
+      spotifyUrl:  spMatch   ? `https://open.spotify.com/track/${spMatch[1]}` : null,
+    });
+  }
+
+  log(`Found ${tracks.length} favorites`, tracks.length > 0 ? 'ok' : 'warn');
   return tracks;
 }
 
