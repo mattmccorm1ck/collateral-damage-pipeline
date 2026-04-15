@@ -139,7 +139,6 @@ async function fetchHypemFavorites() {
   const tracks = [];
   const body = res.body;
 
-  // Raw HTML — split on <h3 tags, one section per track
   const sections = body.split(/<h3[^>]*>/);
 
   for (const section of sections) {
@@ -175,7 +174,6 @@ async function fetchHypemFavorites() {
 // ── Album art resolver ────────────────────────────────────────────────────────
 
 async function resolveArt(track) {
-  // 1. Spotify oEmbed
   if (track.spotifyUrl) {
     try {
       const res = await request(
@@ -191,7 +189,6 @@ async function resolveArt(track) {
     } catch (_) {}
   }
 
-  // 2. Bandcamp CDN
   if (track.bandcampUrl) {
     try {
       const redir = await request(track.bandcampUrl, {
@@ -211,7 +208,6 @@ async function resolveArt(track) {
     } catch (_) {}
   }
 
-  // 3. MusicBrainz Cover Art Archive
   try {
     const q = encodeURIComponent(`artist:"${track.artist}" AND release:"${track.title}"`);
     const res = await request(
@@ -281,11 +277,9 @@ Rules:
       .join('')
       .trim();
 
-    // Extract a YouTube URL if present
     const ytMatch = text.match(/https?:\/\/(?:www\.)?youtube\.com\/watch\?v=[\w-]+/);
     if (ytMatch) return ytMatch[0];
 
-    // Also accept youtu.be short links
     const shortMatch = text.match(/https?:\/\/youtu\.be\/[\w-]+/);
     if (shortMatch) return shortMatch[0];
 
@@ -300,7 +294,6 @@ Rules:
 function buildLexical(html, youtubeUrl) {
   const children = [];
 
-  // If we have a YouTube URL, prepend an embed card
   if (youtubeUrl) {
     const vidIdMatch = youtubeUrl.match(/(?:watch\?v=|youtu\.be\/)([\w-]+)/);
     const vidId = vidIdMatch ? vidIdMatch[1] : null;
@@ -322,7 +315,6 @@ function buildLexical(html, youtubeUrl) {
     });
   }
 
-  // HTML card with the post body (prose + streaming buttons + footer)
   children.push({ type: 'html', version: 1, html });
 
   return JSON.stringify({
@@ -336,7 +328,6 @@ function buildLexical(html, youtubeUrl) {
     },
   });
 }
-
 
 // ── Claude post writer ────────────────────────────────────────────────────────
 
@@ -403,11 +394,9 @@ function isDuplicate(track, publishedSlugs, publishedTitles) {
   const slug = makeSlug(track.title, track.artist);
   if (publishedSlugs.has(slug)) return true;
   if (publishedSlugs.has(`${slug}-2`) || publishedSlugs.has(`${slug}-3`)) return true;
-  // Fuzzy match: both artist AND title must appear in an existing post title
-  // to catch the same track with slight naming variations
   const na = normalize(track.artist);
   const nt = normalize(track.title);
-  if (nt.length <= 2) return false; // too short for fuzzy match (e.g., "B")
+  if (nt.length <= 2) return false;
   return publishedTitles.some(t => {
     const tn = normalize(t);
     return tn.includes(na) && tn.includes(nt);
@@ -448,7 +437,7 @@ async function runPipeline(logLines) {
   for (const track of newTracks) {
     emit(`Processing: ${track.artist} — ${track.title}`);
     try {
-      // Resolve art and YouTube in parallel to save time
+      // Resolve art and YouTube in parallel
       const [art, youtubeUrl] = await Promise.all([
         resolveArt(track),
         findYouTubeUrl(track),
@@ -459,10 +448,11 @@ async function runPipeline(logLines) {
       } else {
         emit(`  YouTube: not found`, 'warn');
       }
-// Brief cooldown so YouTube lookup tokens clear the rate limit window
-emit(`  Waiting for rate limit cooldown...`);
-await sleep(10000);
-      
+
+      // Brief cooldown so YouTube lookup tokens clear the rate limit window
+      emit(`  Waiting for rate limit cooldown...`);
+      await sleep(10000);
+
       emit(`  Writing post with Claude...`);
       const html = await writePost(track);
       emit(`  Post written (${html.length} chars)`, 'ok');
@@ -524,10 +514,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const tracks = await fetchHypemFavorites();
       res.writeHead(200);
-      res.end(JSON.stringify({
-        tracks_found: tracks.length,
-        tracks,
-      }));
+      res.end(JSON.stringify({ tracks_found: tracks.length, tracks }));
     } catch (e) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: e.message, stack: e.stack }));
@@ -563,68 +550,71 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── GitHub push endpoint ──────────────────────────────────────────────────
+  if (path === '/github-push') {
+    if (secret !== SECRET) {
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'Invalid secret' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { content, message } = JSON.parse(body);
+        const owner = process.env.GITHUB_REPO_OWNER;
+        const repo  = process.env.GITHUB_REPO_NAME;
+        const token = process.env.GITHUB_TOKEN;
+        if (!token) throw new Error('GITHUB_TOKEN not set');
+
+        // Get current file SHA
+        const fileRes = await request(
+          `https://api.github.com/repos/${owner}/${repo}/contents/server.js`,
+          { headers: { 'Authorization': `Bearer ${token}`, 'User-Agent': 'collateral-damage-pipeline' } }
+        );
+        const { sha } = JSON.parse(fileRes.body);
+
+        // Push update
+        const pushRes = await request(
+          `https://api.github.com/repos/${owner}/${repo}/contents/server.js`,
+          {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+              'User-Agent': 'collateral-damage-pipeline',
+            },
+            body: JSON.stringify({
+              message: message || 'Update via Claude',
+              content: Buffer.from(content).toString('base64'),
+              sha,
+            }),
+          }
+        );
+
+        const result = JSON.parse(pushRes.body);
+        if (pushRes.status !== 200 && pushRes.status !== 201) {
+          throw new Error(result.message);
+        }
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, sha: result.content.sha }));
+      } catch (err) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// ── GitHub push endpoint ──────────────────────────────────────────────────────
-
-if (path === '/github-push') {
-  if (secret !== SECRET) {
-    res.writeHead(401);
-    res.end(JSON.stringify({ error: 'Invalid secret' }));
-    return;
-  }
-
-  let body = '';
-  req.on('data', chunk => body += chunk);
-  req.on('end', async () => {
-    try {
-      const { content, message } = JSON.parse(body);
-      const owner = process.env.GITHUB_REPO_OWNER;
-      const repo  = process.env.GITHUB_REPO_NAME;
-      const token = process.env.GITHUB_TOKEN;
-      if (!token) throw new Error('GITHUB_TOKEN not set');
-
-      // Get current SHA
-      const fileRes = await request(
-        `https://api.github.com/repos/${owner}/${repo}/contents/server.js`,
-        { headers: { 'Authorization': `Bearer ${token}`, 'User-Agent': 'collateral-damage-pipeline' } }
-      );
-      const { sha } = JSON.parse(fileRes.body);
-
-      // Push update
-      const pushRes = await request(
-        `https://api.github.com/repos/${owner}/${repo}/contents/server.js`,
-        {
-          method: 'PUT',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            'User-Agent': 'collateral-damage-pipeline',
-          },
-          body: JSON.stringify({
-            message: message || 'Update via Claude',
-            content: Buffer.from(content).toString('base64'),
-            sha,
-          }),
-        }
-      );
-
-      const result = JSON.parse(pushRes.body);
-      if (pushRes.status !== 200) throw new Error(result.message);
-
-      res.writeHead(200);
-      res.end(JSON.stringify({ ok: true, sha: result.content.sha }));
-    } catch (err) {
-      res.writeHead(500);
-      res.end(JSON.stringify({ error: err.message }));
-    }
-  });
-  return;
-}
 server.listen(PORT, () => {
   console.log(`Collateral Damage pipeline server listening on port ${PORT}`);
   console.log(`Trigger: GET /run?secret=YOUR_SECRET`);
   console.log(`Debug:   GET /debug/hypem`);
+  console.log(`Update:  POST /github-push?secret=YOUR_SECRET`);
 });
