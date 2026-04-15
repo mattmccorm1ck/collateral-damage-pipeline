@@ -239,6 +239,104 @@ async function resolveArt(track) {
   return null;
 }
 
+// ── YouTube URL resolver ──────────────────────────────────────────────────────
+
+async function findYouTubeUrl(track) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const prompt = `Find the official YouTube URL for this song: "${track.title}" by ${track.artist}.
+
+Use web_search to find it. Look for the official music video, or if there isn't one, an official audio upload or the most-viewed legitimate upload.
+
+Rules:
+- Return ONLY a bare YouTube URL (https://www.youtube.com/watch?v=...) with no other text
+- If you cannot find a confident match for this exact song by this exact artist, return the single word: null
+- Do not return cover versions, live versions, or unrelated videos unless nothing else exists`;
+
+  try {
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const res = await request('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body,
+    });
+
+    const data = JSON.parse(res.body);
+    if (data.error) return null;
+
+    const text = (data.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('')
+      .trim();
+
+    // Extract a YouTube URL if present
+    const ytMatch = text.match(/https?:\/\/(?:www\.)?youtube\.com\/watch\?v=[\w-]+/);
+    if (ytMatch) return ytMatch[0];
+
+    // Also accept youtu.be short links
+    const shortMatch = text.match(/https?:\/\/youtu\.be\/[\w-]+/);
+    if (shortMatch) return shortMatch[0];
+
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ── Lexical builder ───────────────────────────────────────────────────────────
+
+function buildLexical(html, youtubeUrl) {
+  const children = [];
+
+  // If we have a YouTube URL, prepend an embed card
+  if (youtubeUrl) {
+    const vidIdMatch = youtubeUrl.match(/(?:watch\?v=|youtu\.be\/)([\w-]+)/);
+    const vidId = vidIdMatch ? vidIdMatch[1] : null;
+
+    children.push({
+      type: 'embed',
+      version: 1,
+      url: youtubeUrl,
+      embedType: 'video',
+      html: vidId
+        ? `<iframe width="560" height="315" src="https://www.youtube.com/embed/${vidId}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>`
+        : '',
+      metadata: vidId ? {
+        thumbnail_url: `https://img.youtube.com/vi/${vidId}/hqdefault.jpg`,
+        thumbnail_width: 480,
+        thumbnail_height: 360,
+      } : {},
+      caption: '',
+    });
+  }
+
+  // HTML card with the post body (prose + streaming buttons + footer)
+  children.push({ type: 'html', version: 1, html });
+
+  return JSON.stringify({
+    root: {
+      children,
+      direction: 'ltr',
+      format: '',
+      indent: 0,
+      type: 'root',
+      version: 1,
+    },
+  });
+}
+
 // ── Claude post writer ────────────────────────────────────────────────────────
 
 async function writePost(track) {
@@ -349,19 +447,25 @@ async function runPipeline(logLines) {
   for (const track of newTracks) {
     emit(`Processing: ${track.artist} — ${track.title}`);
     try {
-      const art  = await resolveArt(track);
+      // Resolve art and YouTube in parallel to save time
+      const [art, youtubeUrl] = await Promise.all([
+        resolveArt(track),
+        findYouTubeUrl(track),
+      ]);
+
+      if (youtubeUrl) {
+        emit(`  YouTube: ${youtubeUrl}`, 'ok');
+      } else {
+        emit(`  YouTube: not found`, 'warn');
+      }
+
       emit(`  Writing post with Claude...`);
       const html = await writePost(track);
       emit(`  Post written (${html.length} chars)`, 'ok');
 
       const slug    = makeSlug(track.title, track.artist);
       const title   = `${track.title} by ${track.artist}`;
-      const lexical = JSON.stringify({
-        root: {
-          children: [{ type: 'html', version: 1, html }],
-          direction: 'ltr', format: '', indent: 0, type: 'root', version: 1,
-        },
-      });
+      const lexical = buildLexical(html, youtubeUrl);
 
       const result = await ghostCreatePost({
         title,
@@ -378,7 +482,7 @@ async function runPipeline(logLines) {
 
       const created = result.data.posts?.[0];
       emit(`  Published: ${created.slug}`, 'ok');
-      published.push({ title, slug: created.slug, art: !!art });
+      published.push({ title, slug: created.slug, art: !!art, youtube: !!youtubeUrl });
       publishedSlugs.add(slug);
       publishedTitles.push(title);
 
