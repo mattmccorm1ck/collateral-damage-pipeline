@@ -336,6 +336,9 @@ function buildLexical(html, youtubeUrl) {
     },
   });
 }
+// Brief cooldown so YouTube lookup tokens clear the rate limit window
+emit(`  Waiting for rate limit cooldown...`);
+await sleep(10000);
 
 // ── Claude post writer ────────────────────────────────────────────────────────
 
