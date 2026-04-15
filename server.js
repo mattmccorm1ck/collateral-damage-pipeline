@@ -336,9 +336,7 @@ function buildLexical(html, youtubeUrl) {
     },
   });
 }
-// Brief cooldown so YouTube lookup tokens clear the rate limit window
-emit(`  Waiting for rate limit cooldown...`);
-await sleep(10000);
+
 
 // ── Claude post writer ────────────────────────────────────────────────────────
 
@@ -461,7 +459,10 @@ async function runPipeline(logLines) {
       } else {
         emit(`  YouTube: not found`, 'warn');
       }
-
+// Brief cooldown so YouTube lookup tokens clear the rate limit window
+emit(`  Waiting for rate limit cooldown...`);
+await sleep(10000);
+      
       emit(`  Writing post with Claude...`);
       const html = await writePost(track);
       emit(`  Post written (${html.length} chars)`, 'ok');
