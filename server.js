@@ -29,10 +29,14 @@ function request(reqUrl, options = {}) {
       method:   options.method || 'GET',
       headers:  options.headers || {},
     };
+    const timeout = options.timeout || 30000;
     const req = lib.request(opts, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
+    });
+    req.setTimeout(timeout, () => {
+      req.destroy(new Error(`Request timeout after ${timeout / 1000}s: ${reqUrl}`));
     });
     req.on('error', reject);
     if (options.body) req.write(options.body);
@@ -53,6 +57,27 @@ function makeSlug(title, artist) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '');
+}
+
+function decodeHtmlEntities(str) {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&eacute;/g, 'é')
+    .replace(/&egrave;/g, 'è')
+    .replace(/&agrave;/g, 'à')
+    .replace(/&aacute;/g, 'á')
+    .replace(/&oacute;/g, 'ó')
+    .replace(/&uacute;/g, 'ú')
+    .replace(/&ntilde;/g, 'ñ')
+    .replace(/&ouml;/g, 'ö')
+    .replace(/&uuml;/g, 'ü')
+    .replace(/&auml;/g, 'ä')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)));
 }
 
 // ── Ghost API ─────────────────────────────────────────────────────────────────
@@ -94,7 +119,6 @@ async function ghostCreatePost(post) {
 }
 
 // ── HypeM scraper ─────────────────────────────────────────────────────────────
-// Uses HypeM's public JSON playlist endpoint — no auth required
 
 async function fetchHypemFavorites() {
   const user = process.env.HYPEM_USER || 'irieidea';
@@ -124,8 +148,8 @@ async function fetchHypemFavorites() {
     const trackIdMatch = section.match(/href="\/track\/([a-z0-9]+)\//i);
     if (!artistMatch || !titleMatch || !trackIdMatch) continue;
 
-    const artist  = artistMatch[1].trim();
-    const title   = titleMatch[1].trim();
+    const artist  = decodeHtmlEntities(artistMatch[1].trim());
+    const title   = decodeHtmlEntities(titleMatch[1].trim());
     const trackId = trackIdMatch[1];
 
     const favMatch  = section.match(/class="num-loved"[^>]*>(\d+)</);
@@ -148,11 +172,10 @@ async function fetchHypemFavorites() {
   return tracks;
 }
 
-
 // ── Album art resolver ────────────────────────────────────────────────────────
 
 async function resolveArt(track) {
-  // 1. Spotify oEmbed — clean, reliable, returns 300x300 art
+  // 1. Spotify oEmbed
   if (track.spotifyUrl) {
     try {
       const res = await request(
@@ -168,7 +191,7 @@ async function resolveArt(track) {
     } catch (_) {}
   }
 
-  // 2. Bandcamp CDN — follow hypem redirect → bandcamp page → extract art ID
+  // 2. Bandcamp CDN
   if (track.bandcampUrl) {
     try {
       const redir = await request(track.bandcampUrl, {
@@ -179,7 +202,7 @@ async function resolveArt(track) {
         const page = await request(bcUrl.split('?')[0], {
           headers: { 'User-Agent': 'Mozilla/5.0' }
         });
-        const artMatch = page.body.match(/f4\.bcbits\.com\/img\/a(\d+)_/);
+        const artMatch = page.body.match(/f4\.bcbits\.com\/img\/a(\d+)/);
         if (artMatch) {
           log(`  Art: Bandcamp CDN (id: ${artMatch[1]})`, 'ok');
           return `https://f4.bcbits.com/img/a${artMatch[1]}_10.jpg`;
@@ -281,11 +304,14 @@ function isDuplicate(track, publishedSlugs, publishedTitles) {
   const slug = makeSlug(track.title, track.artist);
   if (publishedSlugs.has(slug)) return true;
   if (publishedSlugs.has(`${slug}-2`) || publishedSlugs.has(`${slug}-3`)) return true;
+  // Fuzzy match: both artist AND title must appear in an existing post title
+  // to catch the same track with slight naming variations
   const na = normalize(track.artist);
   const nt = normalize(track.title);
+  if (nt.length <= 2) return false; // too short for fuzzy match (e.g., "B")
   return publishedTitles.some(t => {
     const tn = normalize(t);
-    return tn.includes(na) || (nt.length > 2 && tn.includes(nt));
+    return tn.includes(na) && tn.includes(nt);
   });
 }
 
@@ -299,19 +325,16 @@ async function runPipeline(logLines) {
 
   emit('Pipeline started');
 
-  // 1. Get existing Ghost posts for dedup
-  emit('Fetching existing Ghost posts...');
+  emit('Fetching existing Ghost posts…');
   const postData = await ghostGet('/posts/?status=all&fields=slug,title&limit=all');
   const allPosts = postData.posts || [];
   const publishedSlugs  = new Set(allPosts.map(p => p.slug));
   const publishedTitles = allPosts.map(p => p.title);
   emit(`${allPosts.length} existing posts indexed`, 'ok');
 
-  // 2. Fetch HypeM favorites
   const tracks = await fetchHypemFavorites();
   emit(`${tracks.length} HypeM favorites fetched`, tracks.length > 0 ? 'ok' : 'warn');
 
-  // 3. Filter to new tracks only
   const newTracks = tracks.filter(t => !isDuplicate(t, publishedSlugs, publishedTitles));
   emit(`${newTracks.length} new tracks to publish`);
 
@@ -383,39 +406,17 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json');
 
-  // Health check
   if (path === '/health') {
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, running, ts: new Date().toISOString() }));
     return;
   }
 
-  // Debug: show raw HTML snippet AND parsed tracks
   if (path === '/debug/hypem') {
     try {
-      const user = process.env.HYPEM_USER || 'irieidea';
-      const r = await request(`https://hypem.com/${user}`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
-      });
-      const body = r.body;
-      // Find first track-related chunk
-      const idx = body.indexOf('Siltbreeze');
-      const chunk = idx >= 0 ? body.slice(Math.max(0, idx-200), idx+600) : body.slice(0, 800);
-      // Count section splits
-      const sectionCount = (body.match(/\n### /g) || []).length;
       const tracks = await fetchHypemFavorites();
       res.writeHead(200);
       res.end(JSON.stringify({
-        http_status: r.status,
-        body_length: body.length,
-        section_count: sectionCount,
-        has_hash3: body.includes('### '),
-        has_backslash_dash: body.includes('\\-'),
-        has_siltbreeze: body.includes('Siltbreeze'),
-        raw_chunk: chunk,
         tracks_found: tracks.length,
         tracks,
       }));
@@ -426,7 +427,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Run pipeline
   if (path === '/run') {
     if (secret !== SECRET) {
       res.writeHead(401);
