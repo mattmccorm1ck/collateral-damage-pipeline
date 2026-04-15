@@ -567,6 +567,62 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
+// ── GitHub push endpoint ──────────────────────────────────────────────────────
+
+if (path === '/github-push') {
+  if (secret !== SECRET) {
+    res.writeHead(401);
+    res.end(JSON.stringify({ error: 'Invalid secret' }));
+    return;
+  }
+
+  let body = '';
+  req.on('data', chunk => body += chunk);
+  req.on('end', async () => {
+    try {
+      const { content, message } = JSON.parse(body);
+      const owner = process.env.GITHUB_REPO_OWNER;
+      const repo  = process.env.GITHUB_REPO_NAME;
+      const token = process.env.GITHUB_TOKEN;
+      if (!token) throw new Error('GITHUB_TOKEN not set');
+
+      // Get current SHA
+      const fileRes = await request(
+        `https://api.github.com/repos/${owner}/${repo}/contents/server.js`,
+        { headers: { 'Authorization': `Bearer ${token}`, 'User-Agent': 'collateral-damage-pipeline' } }
+      );
+      const { sha } = JSON.parse(fileRes.body);
+
+      // Push update
+      const pushRes = await request(
+        `https://api.github.com/repos/${owner}/${repo}/contents/server.js`,
+        {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'collateral-damage-pipeline',
+          },
+          body: JSON.stringify({
+            message: message || 'Update via Claude',
+            content: Buffer.from(content).toString('base64'),
+            sha,
+          }),
+        }
+      );
+
+      const result = JSON.parse(pushRes.body);
+      if (pushRes.status !== 200) throw new Error(result.message);
+
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, sha: result.content.sha }));
+    } catch (err) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  });
+  return;
+}
 server.listen(PORT, () => {
   console.log(`Collateral Damage pipeline server listening on port ${PORT}`);
   console.log(`Trigger: GET /run?secret=YOUR_SECRET`);
